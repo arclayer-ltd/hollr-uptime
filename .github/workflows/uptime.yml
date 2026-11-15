@@ -1,0 +1,68 @@
+name: uptime
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'   # every 10 minutes (GitHub may start it a few minutes late)
+  workflow_dispatch:
+    inputs:
+      simulate_failure:
+        description: 'Fail on purpose to test the alert'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  issues: write
+  actions: write
+
+concurrency:
+  group: uptime
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check hollr.space
+        id: check
+        run: |
+          if [ "${{ inputs.simulate_failure }}" = "true" ]; then
+            echo "FAIL simulated failure (test of the alert)" | tee -a "$GITHUB_STEP_SUMMARY"; exit 1
+          fi
+          bash scripts/check.sh
+
+      - name: Open an alert issue
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          open=$(gh issue list -R "$GITHUB_REPOSITORY" --label down --state open --json number --jq '.[0].number')
+          if [ -z "$open" ]; then
+            gh label create down --color B60205 -R "$GITHUB_REPOSITORY" 2>/dev/null || true
+            gh issue create -R "$GITHUB_REPOSITORY" --label down \
+              --title "hollr.space is DOWN ($(date -u '+%Y-%m-%d %H:%M UTC'))" \
+              --body "A check failed after 3 tries. Details: $RUN_URL"
+          else
+            gh issue comment "$open" -R "$GITHUB_REPOSITORY" --body "Still failing: $RUN_URL"
+          fi
+
+      - name: Close the alert issue when back up
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for n in $(gh issue list -R "$GITHUB_REPOSITORY" --label down --state open --json number --jq '.[].number'); do
+            gh issue close "$n" -R "$GITHUB_REPOSITORY" --comment "Back up at $(date -u '+%Y-%m-%d %H:%M UTC')."
+          done
+
+      # GitHub turns off scheduled workflows in repos with no activity for 60 days.
+      # Re-enabling it through the API resets that clock.
+      - name: Keep the schedule alive
+        if: always() && github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/$GITHUB_REPOSITORY/actions/workflows/uptime.yml/enable" || true
